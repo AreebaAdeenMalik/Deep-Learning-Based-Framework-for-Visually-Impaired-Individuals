@@ -45,5 +45,5 @@ If you use this repository, please cite the associated research article.
 
 ## Contact
 
-Areeba Adeen Malik
-National University of Sciences and Technology (NUST), Islamabad, Pakistan
+- Areeba Adeen Malik
+- National University of Sciences and Technology (NUST), Islamabad, Pakistan
