@@ -4,7 +4,6 @@ MiDaS Monocular Depth Estimation Module
 Provides GPU-accelerated real-time depth estimation from video frames.
 Converts relative depth to approximate distance measures.
 
-Author: Master's Thesis Project - Assistive Navigation System
 """
 
 import cv2
