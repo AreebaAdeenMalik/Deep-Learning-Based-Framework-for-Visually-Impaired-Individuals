@@ -4,7 +4,6 @@ YOLOv12 Object Detection Module
 Provides GPU-accelerated YOLOv12 inference for real-time object detection.
 Outputs structured detection results with confidence scores and bounding boxes.
 
-Author: Master's Thesis Project - Assistive Navigation System
 """
 
 import torch
