@@ -99,58 +99,95 @@ class MiDaSDepthEstimator:
             print(f"[MiDaS] Inference error: {str(e)}")
             return None
 
-    def get_distance_at_point(self, depth_map, x, y, normalize=True):
+    # ---------------------------------------------------------------- #
+    # Proximity API (relative, calibration-free)                       #
+    # ---------------------------------------------------------------- #
+    # MiDaS v2.1 emits a relative inverse-depth tensor in arbitrary    #
+    # units. It is NOT metric and cannot be turned into metres without #
+    # a calibration step. We therefore expose two derived quantities:  #
+    #   proximity (float in [0,1]):   1.0 = nearest pixel in frame,    #
+    #                                 0.0 = farthest pixel in frame.   #
+    #   proximity_label (str):        "near" | "mid" | "far"           #
+    # These are produced from a per-frame min-max normalization of the #
+    # inverse-depth map, which is robust to MiDaS's arbitrary scale.   #
+    # ---------------------------------------------------------------- #
+
+    # Bucket cut-offs on the normalized inverse-depth (1.0 = closest).
+    PROXIMITY_NEAR = 0.70   # >= 0.70  -> "near"
+    PROXIMITY_MID = 0.40    # 0.40-0.70 -> "mid"; below -> "far"
+
+    @staticmethod
+    def _normalize_inverse_depth(depth_map: "np.ndarray") -> "np.ndarray":
+        """Min-max normalize a MiDaS inverse-depth map to [0, 1].
+
+        After this transform: 1.0 = pixel closest to camera in THIS frame,
+        0.0 = pixel farthest. We use this as a unitless 'proximity' map.
         """
-        Get estimated distance (in arbitrary units) at a specific pixel coordinate.
-        
-        Args:
-            depth_map (np.ndarray): Depth map from estimate_depth()
-            x (int): X pixel coordinate
-            y (int): Y pixel coordinate
-            normalize (bool): If True, normalize depth to 0-1 range
-            
-        Returns:
-            float: Estimated distance/depth value at point
-        """
-        if depth_map is None or x < 0 or y < 0:
+        if depth_map is None:
+            return None
+        d_min = float(depth_map.min())
+        d_max = float(depth_map.max())
+        if d_max - d_min < 1e-6:
+            return np.zeros_like(depth_map, dtype=np.float32)
+        return ((depth_map - d_min) / (d_max - d_min)).astype(np.float32)
+
+    @classmethod
+    def _label_proximity(cls, p: float) -> str:
+        if p >= cls.PROXIMITY_NEAR:
+            return "near"
+        if p >= cls.PROXIMITY_MID:
+            return "mid"
+        return "far"
+
+    def get_proximity_at_point(self, proximity_map, x, y):
+        """Look up the normalized proximity (1=closest, 0=farthest) at (x,y)."""
+        if proximity_map is None:
             return 0.0
-        
-        # Clip coordinates to valid range
-        h, w = depth_map.shape
+        h, w = proximity_map.shape
         x = min(max(int(x), 0), w - 1)
         y = min(max(int(y), 0), h - 1)
-        
-        depth_value = depth_map[y, x]
-        
-        # Normalize if requested: invert and scale to 0-10 meters
-        if normalize:
-            norm_depth = (1.0 / (1.0 + depth_value)) * 10.0
-            return float(norm_depth)
-        
-        return float(depth_value)
+        return float(proximity_map[y, x])
 
-    def get_distances_for_detections(self, depth_map, detections):
+    def enrich_detections_with_proximity(self, depth_map, detections):
+        """Annotate each detection with `proximity` (0..1) and `proximity_label`.
+
+        The legacy `distance` field (claimed to be metres) is intentionally
+        NOT produced - MiDaS v2.1 cannot give metric distances without
+        calibration. Downstream code should consume `proximity` only.
         """
-        Get depth estimates for each detected object (using center point).
-        
-        Args:
-            depth_map (np.ndarray): Depth map from estimate_depth()
-            detections (list): Detection list with 'center' fields
-            
-        Returns:
-            list: Updated detections with 'distance' field added
-        """
-        detections_with_depth = []
-        
+        if depth_map is None:
+            return [dict(det) for det in detections]
+
+        prox_map = self._normalize_inverse_depth(depth_map)
+
+        out = []
         for det in detections:
-            det_copy = det.copy()
+            det_copy = dict(det)
             if "center" in det:
                 cx, cy = det["center"]
-                distance = self.get_distance_at_point(depth_map, cx, cy, normalize=True)
-                det_copy["distance"] = distance
-            detections_with_depth.append(det_copy)
-        
-        return detections_with_depth
+                p = self.get_proximity_at_point(prox_map, cx, cy)
+                det_copy["proximity"] = p
+                det_copy["proximity_label"] = self._label_proximity(p)
+            else:
+                det_copy["proximity"] = 0.0
+                det_copy["proximity_label"] = "far"
+            out.append(det_copy)
+        return out
+
+    # ---------------- Backward-compat shims (deprecated) ---------------- #
+
+    def get_distance_at_point(self, depth_map, x, y, normalize=True):
+        """DEPRECATED: returns proximity in [0,1] (1=closest) - NOT metres.
+
+        Kept only so external scripts importing this method don't crash.
+        New code must use `get_proximity_at_point`.
+        """
+        prox_map = self._normalize_inverse_depth(depth_map)
+        return self.get_proximity_at_point(prox_map, x, y)
+
+    def get_distances_for_detections(self, depth_map, detections):
+        """DEPRECATED alias of `enrich_detections_with_proximity`."""
+        return self.enrich_detections_with_proximity(depth_map, detections)
 
     def get_fps(self):
         """Calculate average FPS from recent inference times."""
