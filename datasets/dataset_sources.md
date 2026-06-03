@@ -6,7 +6,7 @@ Official Website:
 https://cocodataset.org
 
 Description:
-The object detection component utilizes YOLOv12 weights originally trained on the COCO dataset.
+The object detection and depth estimation component utilizes YOLOv12 weights originally trained on the COCO dataset.
 
 The COCO dataset contains:
 
