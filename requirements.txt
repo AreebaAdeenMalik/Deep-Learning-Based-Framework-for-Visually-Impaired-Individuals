@@ -1,5 +1,19 @@
+# ---- Core CV + DL stack ----
 opencv-python~=4.12.0.88
 torch~=2.9.1
 numpy~=2.2.6
-ultralytics~=8.3.232
-timm~=1.0.22
+ultralytics~=8.3.232      # YOLOv12
+timm~=1.0.22              # MiDaS backbone
+
+# ---- LLaVA contextual reasoning ----
+transformers>=4.40.0      # provides LlavaForConditionalGeneration / LlavaNextForConditionalGeneration
+accelerate>=0.30.0        # device_map="auto", fp16/4bit dispatch
+bitsandbytes>=0.43.0      # 4-bit NF4 quantization (CUDA only)
+sentencepiece>=0.1.99
+protobuf>=4.25.0
+Pillow>=10.0.0            # image conversion for LLaVA processor
+safetensors>=0.4.0
+einops>=0.7.0
+
+# ---- Text-to-speech ----
+pyttsx3>=2.90
