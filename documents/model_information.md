@@ -20,6 +20,9 @@ Confidence Scores
 Purpose:
 Monocular Depth Estimation
 
+Training:
+Trained on COCO Dataset
+
 Output:
 Relative Depth Maps
 
