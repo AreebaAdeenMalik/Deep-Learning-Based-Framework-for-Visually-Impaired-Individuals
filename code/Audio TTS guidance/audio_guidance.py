@@ -1,13 +1,19 @@
 """
-Audio Guidance System Module
-=============================
-Provides real-time text-to-speech (TTS) guidance for visually impaired navigation.
-Handles non-blocking audio output with priority-based message queueing.
+Audio Guidance System
+=====================
+Pure TTS player. The previous rule-based `SafetyAlerts` catalogue (e.g.
+"Move slightly to the left", "Stairs detected, be careful", etc.) has
+been REMOVED - LLaVA now generates every spoken sentence based on the
+fused multimodal context.
 
+The only rule-based string that remains here is `EMERGENCY_STOP`, which
+is uttered when the fusion engine raises the latency-critical emergency
+flag. This is intentional: emergency stops must never wait on a 1-3 s
+LLM call (per the thesis spec).
 """
 
-import threading
 import queue
+import threading
 import time
 
 try:
@@ -15,120 +21,149 @@ try:
     PYTTSX3_AVAILABLE = True
 except ImportError:
     PYTTSX3_AVAILABLE = False
-    print("[Audio] WARNING: pyttsx3 not installed. Audio guidance will be disabled.")
-    print("[Audio] Install with: pip install pyttsx3")
+    print("[Audio] WARNING: pyttsx3 not installed. Install with: pip install pyttsx3")
+
+
+# Generic fallback used only when the fusion engine cannot describe the
+# obstacle (e.g. emergency_reason is empty). When the safety layer DOES
+# describe it, `build_emergency_message()` constructs a data-driven line
+# using the actual object class and side from the fused context.
+EMERGENCY_STOP_MESSAGE = "Stop. Obstacle directly ahead."
+
+
+def build_emergency_message(
+    label: str | None = None,
+    side: str | None = None,
+    proximity_label: str | None = None,
+) -> str:
+    """Build a short data-driven emergency utterance.
+
+    Examples:
+        ('person', 'center', 'near')  -> "Stop. Person very close ahead."
+        ('car', 'left', 'near')       -> "Stop. Car very close on the left."
+        (None, None, None)            -> EMERGENCY_STOP_MESSAGE
+    """
+    if not label:
+        return EMERGENCY_STOP_MESSAGE
+
+    # Map proximity_label to a spoken qualifier.
+    qualifier = {
+        "near": "very close",
+        "mid": "close",
+        "far": "ahead",
+    }.get(proximity_label or "", "close")
+
+    # Map horizontal zone to natural English direction.
+    direction = {
+        "center": "ahead",
+        "left": "on the left",
+        "right": "on the right",
+    }.get(side or "center", "ahead")
+
+    return f"Stop. {label.capitalize()} {qualifier} {direction}."
 
 
 class AudioGuidanceSystem:
-    """
-    Text-to-speech based guidance system for real-time assistive navigation.
-    Manages message queue and non-blocking audio output.
-    """
+    """Non-blocking text-to-speech player with priority interrupt."""
 
-    def __init__(self, rate=150, volume=1.0, voice_id=0):
-        """
-        Initialize audio guidance system.
-
-        Args:
-            rate (int): Speech rate (words per minute, default 150)
-            volume (float): Volume level (0.0-1.0, default 1.0)
-            voice_id (int): Voice index (0=male, 1=female if available)
-        """
+    def __init__(self, rate=160, volume=1.0, voice_id=0):
         if not PYTTSX3_AVAILABLE:
-            print("[Audio] pyttsx3 not available - audio disabled")
             self.engine = None
             self.audio_disabled = True
+            print("[Audio] pyttsx3 unavailable - audio disabled")
             return
 
         self.audio_disabled = False
         self.engine = pyttsx3.init()
-        
-        # Configure speech parameters
-        self.engine.setProperty('rate', rate)
-        self.engine.setProperty('volume', volume)
-        
-        # Set voice
-        voices = self.engine.getProperty('voices')
-        if voice_id < len(voices):
-            self.engine.setProperty('voice', voices[voice_id].id)
-        
-        # Message queue for non-blocking operation
-        self.message_queue = queue.Queue()
+        self.engine.setProperty("rate", rate)
+        self.engine.setProperty("volume", volume)
+        voices = self.engine.getProperty("voices")
+        if voices and voice_id < len(voices):
+            self.engine.setProperty("voice", voices[voice_id].id)
+
+        self.message_queue: "queue.PriorityQueue" = queue.PriorityQueue()
+        self._seq = 0  # tie-breaker to keep PriorityQueue stable
         self.is_running = True
-        
-        # Start audio processing thread
+
+        self._last_spoken = ""
+        self._last_spoken_at = 0.0
+        self._dedup_window_s = 2.0  # don't repeat the same sentence within 2s
+
         self.audio_thread = threading.Thread(target=self._audio_worker, daemon=True)
         self.audio_thread.start()
-        
         print("[Audio] Guidance system initialized")
 
+    # ----------------------- worker ----------------------- #
+
     def _audio_worker(self):
-        """
-        Worker thread that processes messages from queue.
-        Runs in background to avoid blocking main thread.
-        """
         if self.audio_disabled or not self.engine:
             return
-
         while self.is_running:
             try:
-                # Get message from queue with timeout
-                message, priority = self.message_queue.get(timeout=0.5)
-                
-                # Speak the message
+                priority, _seq, message = self.message_queue.get(timeout=0.5)
+                if message is None:
+                    self.message_queue.task_done()
+                    continue
                 self.engine.say(message)
                 self.engine.runAndWait()
-                
                 self.message_queue.task_done()
-                
             except queue.Empty:
-                # No message in queue, continue waiting
-                pass
+                continue
             except Exception as e:
-                print(f"[Audio] Error in worker thread: {str(e)}")
+                print(f"[Audio] Worker error: {e}")
 
-    def speak(self, message, priority=1, wait=False):
-        """
-        Queue a message for text-to-speech.
+    # ----------------------- public API ----------------------- #
 
-        Args:
-            message (str): Message to speak
-            priority (int): Priority level (higher = urgent, 0-10)
-            wait (bool): If True, block until message is spoken
-        """
+    def speak(self, message, priority=5, wait=False):
+        """Queue an utterance. Lower `priority` value = spoken sooner."""
         if self.audio_disabled or not self.engine:
             return
-
-        if not message or not isinstance(message, str):
+        if not isinstance(message, str) or not message.strip():
             return
-        
-        try:
-            self.message_queue.put((message, priority), block=False)
-            
-            if wait:
-                self.message_queue.join()  # Wait for queue to empty
-                
-        except queue.Full:
-            print(f"[Audio] Message queue full, dropping: {message}")
 
-    def get_queue_size(self):
-        """Get number of pending messages in queue."""
-        if self.audio_disabled:
-            return 0
-        return self.message_queue.qsize()
+        now = time.time()
+        # Suppress duplicate repeats inside a short window (very common with
+        # nearly-identical LLaVA outputs across frames).
+        if message == self._last_spoken and (now - self._last_spoken_at) < self._dedup_window_s:
+            return
+        self._last_spoken = message
+        self._last_spoken_at = now
+
+        self._seq += 1
+        try:
+            self.message_queue.put((priority, self._seq, message), block=False)
+            if wait:
+                self.message_queue.join()
+        except queue.Full:
+            print(f"[Audio] queue full - dropped: {message}")
+
+    def emergency_speak(self, message: str = EMERGENCY_STOP_MESSAGE):
+        """Highest priority. Clears the queue first to interrupt anything in flight."""
+        if self.audio_disabled or not self.engine:
+            return
+        self.clear_queue()
+        self._seq += 1
+        try:
+            self.message_queue.put((0, self._seq, message), block=False)
+        except queue.Full:
+            pass
 
     def clear_queue(self):
-        """Clear all pending messages from queue."""
         if self.audio_disabled:
             return
         while not self.message_queue.empty():
             try:
                 self.message_queue.get_nowait()
+                self.message_queue.task_done()
             except queue.Empty:
                 break
 
+    def get_queue_size(self):
+        if self.audio_disabled:
+            return 0
+        return self.message_queue.qsize()
+
     def shutdown(self):
-        """Shutdown audio system gracefully."""
         if self.audio_disabled:
             return
         print("[Audio] Shutting down...")
@@ -138,109 +173,10 @@ class AudioGuidanceSystem:
         print("[Audio] Shutdown complete")
 
 
-class SafetyAlerts:
-    """
-    Pre-configured safety alert messages for assistive navigation.
-    """
-
-    # Obstacle warnings
-    OBSTACLE_AHEAD = "Obstacle ahead"
-    OBSTACLE_LEFT = "Obstacle on the left"
-    OBSTACLE_RIGHT = "Obstacle on the right"
-    CLEAR_PATH = "Path is clear"
-    
-    # Distance-based warnings
-    @staticmethod
-    def obstacle_distance(distance_m):
-        """Generate distance-based warning."""
-        if distance_m < 0.5:
-            return f"Very close obstacle, {distance_m:.1f} meters away"
-        elif distance_m < 1.0:
-            return f"Close obstacle, {distance_m:.1f} meters away"
-        elif distance_m < 2.0:
-            return f"Obstacle {distance_m:.1f} meters away"
-        else:
-            return f"Object detected {distance_m:.1f} meters ahead"
-
-    # Object-specific warnings
-    @staticmethod
-    def object_detected(obj_class, distance_m=None, direction=None):
-        """Generate object detection message."""
-        msg = f"{obj_class} detected"
-        
-        if direction:
-            msg += f" on the {direction}"
-        if distance_m:
-            msg += f" {distance_m:.1f} meters"
-        
-        return msg
-
-    # Navigation guidance
-    MOVE_LEFT = "Move slightly to the left"
-    MOVE_RIGHT = "Move slightly to the right"
-    MOVE_FORWARD = "Move forward carefully"
-    STOP = "Stop immediately"
-    
-    # Door and obstacle detection
-    @staticmethod
-    def obstacle_type(obj_class):
-        """Get appropriate message for obstacle type."""
-        messages = {
-            'person': 'Person detected, move aside',
-            'door': 'Door detected ahead',
-            'stairs': 'Stairs detected, be careful',
-            'chair': 'Chair detected',
-            'table': 'Table detected',
-            'car': 'Vehicle detected',
-            'bicycle': 'Bicycle detected',
-        }
-        return messages.get(obj_class, f'{obj_class} detected')
-
-    # Status messages
-    SYSTEM_READY = "System ready for navigation"
-    SYSTEM_INACTIVE = "Navigation system inactive"
-    CALIBRATION_REQUIRED = "Camera calibration required"
-    GPS_SIGNAL_LOST = "GPS signal lost"
-
-
-def demo_audio_system():
-    """
-    Demonstration of the audio guidance system.
-    """
-    print("\n" + "="*60)
-    print("Audio Guidance System Demo")
-    print("="*60)
-    
-    # Initialize system
-    audio = AudioGuidanceSystem(rate=150, volume=1.0)
-    
-    # Test messages
-    test_messages = [
-        (SafetyAlerts.SYSTEM_READY, 5),
-        (SafetyAlerts.obstacle_detected('person', 2.5, 'left'), 4),
-        (SafetyAlerts.obstacle_distance(1.2), 5),
-        (SafetyAlerts.MOVE_RIGHT, 4),
-        (SafetyAlerts.CLEAR_PATH, 3),
-    ]
-    
-    # Queue all messages
-    for msg, priority in test_messages:
-        print(f"Queuing: {msg}")
-        audio.speak(msg, priority=priority)
-        time.sleep(0.5)
-    
-    # Wait for all messages to be spoken
-    print("\nWaiting for audio to complete...")
-    audio.message_queue.join()
-    
-    # Shutdown
-    audio.shutdown()
-    print("Demo complete!")
-
-
 if __name__ == "__main__":
-    demo_audio_system()
-
-
-
-
+    a = AudioGuidanceSystem()
+    a.speak("System ready.", priority=3)
+    a.speak("Path looks clear. Continue forward.", priority=5)
+    a.emergency_speak()
+    time.sleep(6)
+    a.shutdown()
