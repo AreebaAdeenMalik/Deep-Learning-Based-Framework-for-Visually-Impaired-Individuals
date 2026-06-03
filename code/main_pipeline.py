@@ -1,534 +1,560 @@
 """
-Main Integrated Pipeline
-=========================
-Combines YOLOv12, MiDaS, ORB-SLAM, Contextual Awareness, and Audio Guidance
-into a unified real-time assistive navigation system.
+Main Integrated Pipeline (LLaVA-centric)
+========================================
+Real-time assistive-navigation pipeline that uses LLaVA as the
+contextual-reasoning brain. The exact data flow is:
+
+    Camera Frame
+        |
+        v
+    YOLOv12  ----- object detections (class, conf, bbox, center)
+        |
+        v
+    MiDaS    ----- per-object distance (metres, approx.)
+        |
+        v
+    ORB VO   ----- features, matches, score, ego-motion direction
+        |
+        v
+    FusionEngine ----- FusedContext (objects + spatial zones + ego-motion
+                                     + rule-based emergency_stop flag)
+        |
+        v
+    PromptEngineering ----- structured text prompt
+        |
+        v
+    LLaVA (image + prompt) ----- natural-language navigation instruction
+        |
+        v
+    AudioGuidance (TTS) ----- spoken to the visually-impaired user
+
+The ONLY rule-based shortcut is the latency-critical emergency stop,
+which speaks `EMERGENCY_STOP_MESSAGE` directly without consulting LLaVA.
 
 """
 
-import cv2
-import torch
-import numpy as np
-import time
 import os
+import time
+
+import cv2
+import numpy as np
+import torch
+
+import global_config
 from Yolo12 import YOLOv12Detector
 from my_midas import MiDaSDepthEstimator
 from orb_slam_single_image import VisualOdometryORB, load_camera_params
-from contextual_awareness import ContextualAwarenessEngine
-from audio_guidance import AudioGuidanceSystem, SafetyAlerts
+from fusion_engine import FusionEngine
+from prompt_engineering import build_prompt
+from llava_reasoning import LlavaReasoningEngine
+from contextual_awareness import ContextualAwarenessEngine  # used only for viz overlay
+from audio_guidance import (
+    AudioGuidanceSystem,
+    EMERGENCY_STOP_MESSAGE,
+    build_emergency_message,
+)
 
 
 class AssistiveNavigationPipeline:
-    """
-    Main unified pipeline for real-time assistive navigation.
-    Integrates all computer vision and AI components.
-    """
+    """End-to-end multimodal pipeline: YOLO + MiDaS + ORB + Fusion + LLaVA + TTS."""
 
-    def __init__(self, enable_audio=True, enable_display=True, confidence_threshold=0.45):
-        """
-        Initialize the complete navigation pipeline.
+    def __init__(
+        self,
+        enable_audio: bool = True,
+        enable_display: bool = True,
+        confidence_threshold: float = 0.45,
+        llava_every_n_frames: int = 1,
+    ):
+        print("\n" + "=" * 70)
+        print("ASSISTIVE NAVIGATION SYSTEM - INITIALIZATION (LLaVA contextual brain)")
+        print("=" * 70)
 
-        Args:
-            enable_audio (bool): Enable audio guidance
-            enable_display (bool): Enable visual display
-            confidence_threshold (float): Minimum detection confidence
-        """
-        print("\n" + "="*70)
-        print("ASSISTIVE NAVIGATION SYSTEM - INITIALIZATION")
-        print("="*70)
-
-        # Check device
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"\n[Pipeline] Device: {self.device}")
-        if self.device == 'cuda':
+        if self.device == "cuda":
             print(f"[Pipeline] GPU: {torch.cuda.get_device_name(0)}")
 
-        # Initialize components
-        print("\n[Pipeline] Initializing components...")
-        try:
-            self.detector = YOLOv12Detector(
-                model_path="yolo12l.pt",
-                confidence_threshold=confidence_threshold,
-                device=self.device
-            )
-            print("[Pipeline] YOLOv12 initialized ✓")
-        except Exception as e:
-            print(f"[Pipeline] ERROR initializing YOLOv12: {e}")
-            raise
+        # -------------- perception modules -------------- #
+        self.detector = YOLOv12Detector(
+            model_path=getattr(global_config, "yolo_model_path", "yolo12l.pt"),
+            confidence_threshold=confidence_threshold,
+            device=self.device,
+        )
+        print("[Pipeline] YOLOv12 initialized")
 
-        try:
-            self.depth_estimator = MiDaSDepthEstimator(device=self.device)
-            print("[Pipeline] MiDaS initialized ✓")
-        except Exception as e:
-            print(f"[Pipeline] ERROR initializing MiDaS: {e}")
-            raise
+        self.depth_estimator = MiDaSDepthEstimator(device=self.device)
+        print("[Pipeline] MiDaS initialized")
 
-        try:
-            fx, fy, cx, cy = load_camera_params("webcam_config.yaml")
-            self.vo = VisualOdometryORB(focal_len=fx, pp=(cx, cy))
-            print("[Pipeline] ORB-SLAM initialized ✓")
-        except Exception as e:
-            print(f"[Pipeline] ERROR initializing ORB-SLAM: {e}")
-            raise
+        fx, fy, cx, cy = load_camera_params(
+            getattr(global_config, "camera_config_path", "webcam_config.yaml")
+        )
+        self.vo = VisualOdometryORB(focal_len=fx, pp=(cx, cy))
+        print("[Pipeline] ORB Visual Odometry initialized")
 
-        try:
-            self.awareness = ContextualAwarenessEngine(frame_width=640, frame_height=480)
-            print("[Pipeline] Contextual Awareness initialized ✓")
-        except Exception as e:
-            print(f"[Pipeline] ERROR initializing Awareness Engine: {e}")
-            raise
+        # -------------- fusion + reasoning -------------- #
+        self.fusion = FusionEngine(
+            frame_width=getattr(global_config, "camera_width", 640),
+            frame_height=getattr(global_config, "camera_height", 480),
+            emergency_proximity_threshold=getattr(
+                global_config, "emergency_proximity_threshold", 0.85),
+            emergency_min_occupancy=getattr(
+                global_config, "emergency_min_occupancy", 0.05),
+            emergency_min_confidence=getattr(
+                global_config, "emergency_min_confidence", 0.55),
+        )
+        print("[Pipeline] FusionEngine initialized")
 
+        self.llava = LlavaReasoningEngine(
+            model_id=getattr(global_config, "llava_model_id", None),
+            device=self.device,
+            load_in_4bit=getattr(global_config, "llava_load_in_4bit", True),
+            max_new_tokens=getattr(global_config, "llava_max_new_tokens", 64),
+            temperature=getattr(global_config, "llava_temperature", 0.2),
+            do_sample=getattr(global_config, "llava_do_sample", False),
+        )
+        if self.llava.available:
+            print("[Pipeline] LLaVA reasoning engine initialized")
+        else:
+            print("[Pipeline] WARNING: LLaVA unavailable - only emergency-stop guidance will be spoken.")
+
+        self.awareness = ContextualAwarenessEngine(frame_width=640, frame_height=480)
+
+        # -------------- audio -------------- #
         if enable_audio:
-            try:
-                self.audio = AudioGuidanceSystem(rate=150, volume=1.0)
-                print("[Pipeline] Audio Guidance initialized ✓")
-                self.enable_audio = True
-            except Exception as e:
-                print(f"[Pipeline] WARNING: Could not initialize audio: {e}")
-                self.audio = None
-                self.enable_audio = False
+            self.audio = AudioGuidanceSystem(
+                rate=getattr(global_config, "audio_rate", 160),
+                volume=getattr(global_config, "audio_volume", 1.0),
+                voice_id=getattr(global_config, "audio_voice_id", 0),
+            )
+            self.enable_audio = not self.audio.audio_disabled
         else:
             self.audio = None
             self.enable_audio = False
 
         self.enable_display = enable_display
+        self.llava_every_n_frames = max(1, int(llava_every_n_frames))
 
-        # Statistics
+        # Stats
         self.frame_count = 0
         self.total_inference_time = 0.0
         self.start_time = time.time()
-        
-        print("\n[Pipeline] Initialization complete! System ready for real-time navigation.")
-        print("="*70 + "\n")
 
-    def process_frame(self, frame):
-        """
-        Process a single frame through the complete pipeline.
+        # Cache last LLaVA guidance so we have something to overlay/announce
+        # on frames where we deliberately SKIP the LLM call (real-time mode).
+        self._last_guidance = ""
+        self._last_guidance_frame = -1
 
-        Args:
-            frame (np.ndarray): Input frame from camera (BGR)
+        print("\n[Pipeline] Initialization complete.\n" + "=" * 70 + "\n")
 
-        Returns:
-            dict: Comprehensive processing results
-        """
-        # Validate frame
+    # ============================================================== #
+    #                       per-frame processing                     #
+    # ============================================================== #
+
+    def process_frame(self, frame: np.ndarray) -> dict:
         if frame is None or not isinstance(frame, np.ndarray):
-            print(f"[Pipeline] ERROR: Invalid frame - expected numpy array, got {type(frame)}")
             return {
-                'status': 'error: invalid_frame',
-                'detections': [],
-                'depth_map': None,
-                'localization': None,
-                'alerts': [],
-                'guidance': '',
-                'frame_id': self.frame_count + 1
+                "status": "error: invalid_frame",
+                "frame_id": self.frame_count + 1,
+                "detections": [], "depth_map": None, "localization": None,
+                "fused_context": None, "guidance": "", "alerts": [],
             }
-        
+
         frame_start = time.time()
         self.frame_count += 1
 
         result = {
-            'frame_id': self.frame_count,
-            'frame_shape': frame.shape,
-            'detections': [],
-            'depth_map': None,
-            'localization': None,
-            'context_analysis': None,
-            'alerts': [],
-            'guidance': '',
-            'timings': {},
-            'status': 'processing'
+            "frame_id": self.frame_count,
+            "frame_shape": frame.shape,
+            "detections": [],
+            "depth_map": None,
+            "localization": None,
+            "fused_context": None,
+            "prompt": "",
+            "guidance": "",
+            "guidance_source": "none",  # 'llava' | 'emergency' | 'cached' | 'none'
+            "alerts": [],
+            "timings": {},
+            "status": "processing",
         }
 
         try:
-            # ============================================
-            # STEP 1: Object Detection (YOLOv12)
-            # ============================================
-            yolo_start = time.time()
+            # --------- STEP 1: YOLOv12 --------- #
+            t0 = time.time()
             detections = self.detector.detect_objects(frame, return_annotated=False)
-            result['yolo_time'] = time.time() - yolo_start
-            result['detections'] = detections
+            result["timings"]["yolo"] = time.time() - t0
 
-            # ============================================
-            # STEP 2: Depth Estimation (MiDaS)
-            # ============================================
-            midas_start = time.time()
+            # --------- STEP 2: MiDaS --------- #
+            t0 = time.time()
             depth_map = self.depth_estimator.estimate_depth(frame)
-            result['midas_time'] = time.time() - midas_start
-            result['depth_map'] = depth_map
+            result["timings"]["midas"] = time.time() - t0
+            result["depth_map"] = depth_map
 
-            # ============================================
-            # STEP 3: Fuse YOLO + MiDaS
-            # ============================================
+            # --------- STEP 3: fuse YOLO + MiDaS per object --------- #
             if depth_map is not None and detections:
-                detections_with_depth = self.depth_estimator.get_distances_for_detections(
+                detections = self.depth_estimator.enrich_detections_with_proximity(
                     depth_map, detections
                 )
-                result['detections'] = detections_with_depth
+            result["detections"] = detections
 
-            # ============================================
-            # STEP 4: Visual Localization (ORB-SLAM)
-            # ============================================
-            vo_start = time.time()
+            # --------- STEP 4: ORB Visual Odometry --------- #
+            t0 = time.time()
             localization = self.vo.process_frame(frame)
-            result['vo_time'] = time.time() - vo_start
-            result['localization'] = localization
+            result["timings"]["orb"] = time.time() - t0
+            result["localization"] = localization
 
-            # ============================================
-            # STEP 5: Contextual Analysis
-            # ============================================
-            context_start = time.time()
-            context = self.awareness.analyze_detections(
-                result['detections'],
-                frame_shape=frame.shape
+            # --------- STEP 5: Fusion Engine --------- #
+            t0 = time.time()
+            fused = self.fusion.fuse(
+                frame_id=self.frame_count,
+                frame_shape=frame.shape,
+                detections=detections,
+                localization=localization,
             )
-            result['context_analysis'] = context
-            result['context_time'] = time.time() - context_start
+            result["fused_context"] = fused
+            result["timings"]["fusion"] = time.time() - t0
 
-            # Extract alerts and guidance
-            result['alerts'] = context.get('alerts', [])
-            result['guidance'] = context.get('navigation_guidance', '')
-            result['safety_score'] = context.get('overall_safety_score', 10.0)
+            # Spatial bookkeeping for the debug overlay (no scoring)
+            result["context_analysis"] = self.awareness.analyze_detections(
+                detections, frame_shape=frame.shape
+            )
+            # safety_score is intentionally None - the legacy rule-based
+            # subtraction has been removed. We keep the key only so the
+            # overlay code can detect its absence and skip rendering.
+            result["safety_score"] = result["context_analysis"]["overall_safety_score"]
 
-            # ============================================
-            # STEP 6: Audio Feedback
-            # ============================================
-            if self.enable_audio and self.audio and result['alerts']:
-                # Speak the top alert
-                top_alert = result['alerts'][0]
-                audio_start = time.time()
-                self.audio.speak(top_alert['message'], priority=top_alert['priority'], wait=False)
-                result['audio_time'] = time.time() - audio_start
+            # --------- STEP 6: latency-critical safety override --------- #
+            # If multi-modal agreement raises the emergency flag, speak a
+            # data-driven template IMMEDIATELY at top priority, but DO NOT
+            # skip LLaVA - we still let it produce an enriched follow-up
+            # so guidance is never purely templated.
+            if fused.emergency_stop:
+                nearest_obj = self._nearest_emergency_object(fused)
+                emergency_msg = build_emergency_message(
+                    label=nearest_obj.label if nearest_obj else None,
+                    side=nearest_obj.horizontal_zone if nearest_obj else None,
+                    proximity_label=(
+                        nearest_obj.proximity_label if nearest_obj else None
+                    ),
+                )
+                result["guidance"] = emergency_msg
+                result["guidance_source"] = "emergency"
+                result["alerts"] = [{
+                    "level": "CRITICAL",
+                    "message": fused.emergency_reason,
+                    "priority": 10,
+                }]
+                if self.enable_audio and self.audio:
+                    self.audio.emergency_speak(emergency_msg)
 
-            result['status'] = 'success'
+            # --------- STEP 7: Prompt engineering + LLaVA --------- #
+            # LLaVA runs on EVERY eligible frame, including emergency frames.
+            # On an emergency frame its output enriches (does not replace)
+            # the spoken template, and the safety section in the prompt
+            # tells LLaVA the override is active.
+            if self.llava.available and self.frame_count % self.llava_every_n_frames == 0:
+                prompt = build_prompt(fused)
+                result["prompt"] = prompt
+
+                t0 = time.time()
+                guidance = self.llava.generate(frame, prompt)
+                result["timings"]["llava"] = time.time() - t0
+
+                if guidance:
+                    # Don't overwrite the emergency utterance the user will
+                    # hear first; surface LLaVA as an enrichment instead.
+                    if result["guidance_source"] == "emergency":
+                        result["llava_enrichment"] = guidance
+                    else:
+                        result["guidance"] = guidance
+                        result["guidance_source"] = "llava"
+                    self._last_guidance = guidance
+                    self._last_guidance_frame = self.frame_count
+
+            # If we skipped LLaVA this frame, reuse the most recent guidance
+            if (
+                not result["guidance"]
+                and result["guidance_source"] != "emergency"
+                and self._last_guidance
+            ):
+                result["guidance"] = self._last_guidance
+                result["guidance_source"] = "cached"
+
+            # --------- STEP 8: speak the LLaVA instruction --------- #
+            # Only speak the LLaVA reply when no emergency template was
+            # already spoken this frame (avoids two utterances stacking).
+            if (
+                self.enable_audio and self.audio
+                and result["guidance_source"] == "llava"
+                and result["guidance"]
+            ):
+                self.audio.speak(result["guidance"], priority=5)
+            elif (
+                self.enable_audio and self.audio
+                and result["guidance_source"] == "emergency"
+                and result.get("llava_enrichment")
+            ):
+                # Queue the enrichment behind the emergency utterance.
+                self.audio.speak(result["llava_enrichment"], priority=6)
+
+            result["status"] = "success"
 
         except Exception as e:
-            print(f"[Pipeline] ERROR processing frame: {str(e)}")
-            result['status'] = f'error: {str(e)}'
+            print(f"[Pipeline] ERROR processing frame: {e}")
+            result["status"] = f"error: {e}"
 
-        # ============================================
-        # Calculate total inference time
-        # ============================================
-        result['total_time'] = time.time() - frame_start
-        self.total_inference_time += result['total_time']
-
+        result["total_time"] = time.time() - frame_start
+        self.total_inference_time += result["total_time"]
         return result
 
-    def create_visualization(self, frame, result):
-        """
-        Create visualization with detections, depth, and status info.
+    # ============================================================== #
+    #                       helpers                                  #
+    # ============================================================== #
 
-        Args:
-            frame (np.ndarray): Original input frame
-            result (dict): Processing result from process_frame()
+    def _nearest_emergency_object(self, fused):
+        """Return the FusedObject that triggered the emergency stop, or None.
 
-        Returns:
-            np.ndarray: Annotated visualization frame
+        Re-applies the same multi-modal filter the fusion engine used so
+        the spoken template references the actual culprit object instead
+        of a generic obstacle. Picks the highest-proximity match.
         """
-        # Validate frame
+        if not fused or not fused.objects:
+            return None
+        candidates = [
+            o for o in fused.objects
+            if o.label in self.fusion.emergency_stop_classes
+            and o.confidence >= self.fusion.emergency_min_confidence
+            and o.horizontal_zone == "center"
+            and o.occupancy_ratio >= self.fusion.emergency_min_occupancy
+            and o.proximity >= self.fusion.emergency_proximity_threshold
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda o: o.proximity)
+
+    # ============================================================== #
+    #                       visualisation                            #
+    # ============================================================== #
+
+    def create_visualization(self, frame: np.ndarray, result: dict) -> np.ndarray:
         if frame is None or not isinstance(frame, np.ndarray):
-            print(f"[Pipeline] WARNING: Invalid frame type: {type(frame)}")
             return np.zeros((480, 640, 3), dtype=np.uint8)
-        
-        try:
-            vis_frame = frame.copy()
-        except Exception as e:
-            print(f"[Pipeline] WARNING: Could not copy frame: {e}")
-            return np.zeros((480, 640, 3), dtype=np.uint8)
-        
-        h, w = vis_frame.shape[:2]
+        vis = frame.copy()
+        h, w = vis.shape[:2]
 
-        # Draw detections
-        for det in result['detections']:
-            bbox = det.get('bbox', [0, 0, 0, 0])
-            x1, y1, x2, y2 = bbox
-            
-            # Color based on distance
-            distance = det.get('distance', 999.0)
-            if distance < 1.0:
-                color = (0, 0, 255)  # Red - critical
-            elif distance < 2.5:
-                color = (0, 165, 255)  # Orange - warning
-            else:
-                color = (0, 255, 0)  # Green - safe
+        # Detections (colour and label use relative PROXIMITY, not metres)
+        for det in result.get("detections", []):
+            x1, y1, x2, y2 = det.get("bbox", [0, 0, 0, 0])
+            p = float(det.get("proximity", 0.0))
+            p_label = det.get("proximity_label", "far")
+            color = (
+                (0, 0, 255) if p_label == "near"
+                else (0, 165, 255) if p_label == "mid"
+                else (0, 255, 0)
+            )
+            cv2.rectangle(vis, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+            label = (
+                f"{det.get('class','?')}:{det.get('confidence',0):.2f} "
+                f"{p_label}({p:.2f})"
+            )
+            cv2.putText(vis, label, (int(x1), max(15, int(y1) - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-            cv2.rectangle(vis_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+        # ORB keypoints
+        loc = result.get("localization") or {}
+        keypoints = loc.get("keypoints")
+        if keypoints is not None and len(keypoints) > 0:
+            for pt in keypoints:
+                cv2.circle(vis, (int(pt[0]), int(pt[1])), 2, (255, 0, 255), -1)
 
-            # Label with distance
-            label = f"{det['class']}: {det['confidence']:.2f}"
-            if distance < 999.0:
-                label += f" ({distance:.1f}m)"
+        # Status panel (no rule-based 'safety score' anymore)
+        cv2.putText(vis, f"Frame {result['frame_id']}  FPS {self.get_fps():.1f}",
+                    (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(vis, f"Objects: {len(result.get('detections', []))}",
+                    (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
+        fused_ctx = result.get("fused_context")
+        if fused_ctx is not None and fused_ctx.nearest_object:
             cv2.putText(
-                vis_frame,
-                label,
-                (int(x1), int(y1) - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                2
+                vis,
+                f"Nearest: {fused_ctx.nearest_object} "
+                f"({fused_ctx.nearest_object_proximity_label}, "
+                f"p={fused_ctx.max_proximity:.2f}, {fused_ctx.nearest_object_position})",
+                (10, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1,
             )
 
-        # Draw ORB features
-        if result['localization'] and 'keypoints' in result['localization']:
-            keypoints = result['localization']['keypoints']
-            for pt in keypoints:
-                cv2.circle(vis_frame, (int(pt[0]), int(pt[1])), 2, (255, 0, 255), -1)
+        em = fused_ctx.ego_motion if fused_ctx is not None else None
+        if em is not None:
+            cv2.putText(
+                vis,
+                f"ORB: {em.status}  dir={em.direction}  loc_conf={em.localization_confidence:.2f}",
+                (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1,
+            )
 
-        # Draw status panel (top-left)
-        panel_start_y = 20
-        cv2.putText(vis_frame, f"Frame: {result['frame_id']}", (10, panel_start_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        # Guidance (LLaVA) along the bottom
+        guidance = result.get("guidance", "")
+        src = result.get("guidance_source", "none")
+        if guidance:
+            color = (0, 0, 255) if src == "emergency" else (255, 255, 255)
+            cv2.putText(vis, f"[{src.upper()}] {guidance[:90]}",
+                        (10, h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+        return vis
 
-        fps = self.get_fps()
-        cv2.putText(vis_frame, f"FPS: {fps:.1f}", (10, panel_start_y + 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-        # Detection stats
-        num_detections = len(result['detections'])
-        cv2.putText(vis_frame, f"Objects: {num_detections}", (10, panel_start_y + 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
-        # Safety score
-        safety = result.get('safety_score', 10.0)
-        safety_color = (0, 255, 0) if safety >= 7 else (0, 165, 255) if safety >= 4 else (0, 0, 255)
-        cv2.putText(vis_frame, f"Safety: {safety:.1f}/10", (10, panel_start_y + 90),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, safety_color, 2)
-
-        # Guidance text (bottom)
-        guidance = result.get('guidance', 'Path is clear')
-        cv2.putText(vis_frame, f"Guidance: {guidance}", (10, h - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-        # Alerts (top-right)
-        alerts = result.get('alerts', [])
-        for i, alert in enumerate(alerts[:3]):  # Show top 3 alerts
-            alert_color = (0, 0, 255) if alert['level'] == 'CRITICAL' else (0, 165, 255)
-            cv2.putText(vis_frame, f"{alert['level']}: {alert['message'][:40]}", 
-                        (w - 400, 20 + i * 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, alert_color, 1)
-
-        return vis_frame
-
-    # ======================== WEBCAM MODE (COMMENTED OUT) ========================
-    # def run_real_time(self, camera_id=0, max_frames=None):
-    #     """
-    #     Run the pipeline in real-time mode on webcam.
-    #     DEPRECATED: System now uses image-based processing
-    #
-    #     Args:
-    #         camera_id (int): Camera device ID (default 0)
-    #         max_frames (int): Maximum frames to process (None = infinite)
-    #     """
-    #     print("\n[Pipeline] Starting real-time mode...")
-    #     print("[Pipeline] Press 'q' to quit, 's' to save frame, 'a' to toggle audio\n")
-    #
-    #     cap = cv2.VideoCapture(camera_id)
-    #     if not cap.isOpened():
-    #         print("[Pipeline] ERROR: Could not open camera")
-    #         return
-    #
-    #     # Create results directory if needed
-    #     os.makedirs("results", exist_ok=True)
-    #
-    #     frame_count = 0
-    #     saved_frames = 0
-    #
-    #     try:
-    #         while True:
-    #             ret, frame = cap.read()
-    #             if not ret:
-    #                 print("[Pipeline] No frame from camera")
-    #                 break
-    #
-    #             frame_count += 1
-    #
-    #             # Resize for faster processing
-    #             frame = cv2.resize(frame, (640, 480))
-    #
-    #             # Process frame
-    #             result = self.process_frame(frame)
-    #
-    #             # Create visualization
-    #             vis_frame = self.create_visualization(frame, result)
-    #
-    #             if self.enable_display:
-    #                 cv2.imshow("Assistive Navigation System", vis_frame)
-    #
-    #             # Handle key presses
-    #             key = cv2.waitKey(1) & 0xFF
-    #             if key == ord('q'):
-    #                 print("\n[Pipeline] Quitting...")
-    #                 break
-    #             elif key == ord('s'):
-    #                 saved_frames += 1
-    #                 output_path = f"results/frame_{frame_count}_{int(time.time())}.jpg"
-    #                 cv2.imwrite(output_path, vis_frame)
-    #                 print(f"[Pipeline] Saved: {output_path}")
-    #             elif key == ord('a'):
-    #                 self.enable_audio = not self.enable_audio
-    #                 status = "ENABLED" if self.enable_audio else "DISABLED"
-    #                 print(f"[Pipeline] Audio: {status}")
-    #
-    #             # Check max frames
-    #             if max_frames and frame_count >= max_frames:
-    #                 print(f"[Pipeline] Reached max frames ({max_frames})")
-    #                 break
-    #
-    #     except KeyboardInterrupt:
-    #         print("\n[Pipeline] Interrupted by user")
-    #     finally:
-    #         cap.release()
-    #         cv2.destroyAllWindows()
-    #         if self.audio:
-    #             self.audio.shutdown()
-    #
-    #         # Print session statistics
-    #         self.print_statistics()
-    # ============================================================================
+    # ============================================================== #
+    #                       runners                                  #
+    # ============================================================== #
 
     def run_on_images(self, image_paths=None, image_folder="resources"):
-        """
-        Run the pipeline on images from a folder or list.
-
-        Args:
-            image_paths (list): List of image file paths (if None, uses image_folder)
-            image_folder (str): Folder containing images (default: resources/)
-        """
-        print("\n[Pipeline] Starting image-based processing mode...")
-        
-        # Create results directory if needed
+        print("\n[Pipeline] Image-based processing mode.")
         os.makedirs("results", exist_ok=True)
 
-        # Get image paths
         if image_paths is None:
             if not os.path.exists(image_folder):
-                print(f"[Pipeline] ERROR: Folder not found: {image_folder}")
+                print(f"[Pipeline] ERROR: folder not found: {image_folder}")
                 return
-            
-            image_files = []
-            for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp']:
-                image_files.extend([os.path.join(image_folder, f) 
-                                   for f in os.listdir(image_folder) 
-                                   if f.lower().endswith(ext.replace('*', ''))])
-            image_paths = sorted(image_files)
+            image_paths = sorted([
+                os.path.join(image_folder, f) for f in os.listdir(image_folder)
+                if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp"))
+            ])
 
         if not image_paths:
-            print(f"[Pipeline] ERROR: No images found in {image_folder}")
+            print(f"[Pipeline] No images found in {image_folder}")
             return
-
-        print(f"[Pipeline] Found {len(image_paths)} images to process")
-
-        frame_count = 0
-        saved_frames = 0
+        print(f"[Pipeline] Found {len(image_paths)} images.")
 
         try:
-            for image_path in image_paths:
-                if not os.path.exists(image_path):
-                    print(f"[Pipeline] WARNING: Image not found: {image_path}")
+            for i, path in enumerate(image_paths, 1):
+                if not os.path.exists(path):
+                    print(f"[Pipeline] missing: {path}")
                     continue
-
-                frame_count += 1
-
-                print(f"\n[Pipeline] Processing image {frame_count}/{len(image_paths)}: {os.path.basename(image_path)}")
-
-                # Load image
-                frame = cv2.imread(image_path)
+                print(f"\n[Pipeline] ({i}/{len(image_paths)}) {os.path.basename(path)}")
+                frame = cv2.imread(path)
                 if frame is None:
-                    print(f"[Pipeline] ERROR: Could not load image: {image_path}")
+                    print(f"[Pipeline] cannot read: {path}")
                     continue
-
-                # Resize for consistent processing
                 frame = cv2.resize(frame, (640, 480))
 
-                # Process frame
                 result = self.process_frame(frame)
-
-                # Create visualization
-                vis_frame = self.create_visualization(frame, result)
+                vis = self.create_visualization(frame, result)
 
                 if self.enable_display:
-                    cv2.imshow("Assistive Navigation System - Image Mode", vis_frame)
-                    print("[Pipeline] Press any key to continue to next image...")
-                    cv2.waitKey(0)
+                    cv2.imshow("Assistive Navigation System (LLaVA)", vis)
+                    print("[Pipeline] Press any key for next image (q to quit).")
+                    key = cv2.waitKey(0) & 0xFF
+                    if key == ord("q"):
+                        break
 
-                # Save result
-                saved_frames += 1
-                output_path = f"results/processed_{frame_count}_{os.path.splitext(os.path.basename(image_path))[0]}.jpg"
-                cv2.imwrite(output_path, vis_frame)
-                print(f"[Pipeline] Saved: {output_path}")
+                out_path = f"results/processed_{i}_{os.path.splitext(os.path.basename(path))[0]}.jpg"
+                cv2.imwrite(out_path, vis)
+                print(f"[Pipeline] saved {out_path}")
 
-                # Print frame statistics
-                if result['status'] == 'success':
-                    print(f"  Objects detected: {len(result['detections'])}")
-                    print(f"  Safety score: {result.get('safety_score', 0):.1f}/10")
-                    print(f"  Guidance: {result.get('guidance', 'N/A')}")
-
+                if result["status"] == "success":
+                    print(f"  objects   : {len(result['detections'])}")
+                    fc = result.get("fused_context")
+                    if fc is not None and fc.nearest_object:
+                        print(
+                            f"  nearest   : {fc.nearest_object} "
+                            f"({fc.nearest_object_proximity_label}, "
+                            f"p={fc.max_proximity:.2f}, {fc.nearest_object_position})"
+                        )
+                    print(f"  source    : {result['guidance_source']}")
+                    print(f"  guidance  : {result.get('guidance', '')}")
+                    if result.get("llava_enrichment"):
+                        print(f"  enrich    : {result['llava_enrichment']}")
+                    t = result.get("timings", {})
+                    print(
+                        "  timings   : "
+                        f"yolo={t.get('yolo',0)*1000:.0f}ms  "
+                        f"midas={t.get('midas',0)*1000:.0f}ms  "
+                        f"orb={t.get('orb',0)*1000:.0f}ms  "
+                        f"fusion={t.get('fusion',0)*1000:.0f}ms  "
+                        f"llava={t.get('llava',0)*1000:.0f}ms"
+                    )
         except KeyboardInterrupt:
-            print("\n[Pipeline] Interrupted by user")
+            print("\n[Pipeline] Interrupted.")
         finally:
             cv2.destroyAllWindows()
             if self.audio:
                 self.audio.shutdown()
-
-            # Print session statistics
             self.print_statistics()
-            print(f"\n[Pipeline] Processed {frame_count} images, saved {saved_frames} results")
+
+    def run_realtime(self, camera_id: int = 0, max_frames=None):
+        """Real-time webcam mode.
+
+        For a real-time experience LLaVA is called every Nth frame
+        (`llava_every_n_frames`) so YOLO/MiDaS/ORB never block waiting
+        for the VLM. Emergency stops still fire on every frame.
+        """
+        print("\n[Pipeline] Real-time mode (q to quit)")
+        os.makedirs("results", exist_ok=True)
+        cap = cv2.VideoCapture(camera_id)
+        if not cap.isOpened():
+            print("[Pipeline] ERROR: could not open camera")
+            return
+
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frame = cv2.resize(frame, (640, 480))
+                result = self.process_frame(frame)
+                vis = self.create_visualization(frame, result)
+                if self.enable_display:
+                    cv2.imshow("Assistive Navigation System (LLaVA)", vis)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+                if max_frames and self.frame_count >= max_frames:
+                    break
+        finally:
+            cap.release()
+            cv2.destroyAllWindows()
+            if self.audio:
+                self.audio.shutdown()
+            self.print_statistics()
+
+    # ============================================================== #
+    #                       stats                                    #
+    # ============================================================== #
+
+    def get_fps(self) -> float:
+        elapsed = time.time() - self.start_time
+        return (self.frame_count / elapsed) if elapsed > 0 else 0.0
 
     def print_statistics(self):
-        """Print session statistics."""
         elapsed = time.time() - self.start_time
-        avg_frame_time = self.total_inference_time / self.frame_count if self.frame_count > 0 else 0
-
-        print("\n" + "="*70)
+        avg = (self.total_inference_time / self.frame_count) if self.frame_count else 0
+        print("\n" + "=" * 70)
         print("SESSION STATISTICS")
-        print("="*70)
-        print(f"Frames processed: {self.frame_count}")
-        print(f"Total time: {elapsed:.1f} seconds")
-        print(f"Average FPS: {self.get_fps():.2f}")
-        print(f"Average frame time: {avg_frame_time*1000:.1f} ms")
-        print("="*70 + "\n")
-
-    def get_fps(self):
-        """Calculate current FPS."""
-        elapsed = time.time() - self.start_time
-        if elapsed > 0:
-            return self.frame_count / elapsed
-        return 0.0
+        print("=" * 70)
+        print(f"Frames processed : {self.frame_count}")
+        print(f"Total wall time  : {elapsed:.1f}s")
+        print(f"Average FPS      : {self.get_fps():.2f}")
+        print(f"Average / frame  : {avg*1000:.1f} ms")
+        if hasattr(self, "llava") and self.llava.available:
+            print(f"LLaVA avg latency: {self.llava.average_latency()*1000:.1f} ms  "
+                  f"calls={self.llava.call_count}")
+        print("=" * 70 + "\n")
 
 
 def main():
-    """Main entry point for the assistive navigation system."""
-    print("\n" + "="*70)
-    print("ASSISTIVE NAVIGATION SYSTEM - IMAGE-BASED PROCESSING")
+    print("\n" + "=" * 70)
+    print("ASSISTIVE NAVIGATION SYSTEM (LLaVA-centric)")
     print("Master's Thesis Project")
-    print("="*70)
+    print("=" * 70)
 
-    # Initialize pipeline
     try:
         pipeline = AssistiveNavigationPipeline(
-            enable_audio=True,
-            enable_display=True,
-            confidence_threshold=0.45
+            enable_audio=getattr(global_config, "enable_audio", True),
+            enable_display=getattr(global_config, "enable_display", True),
+            confidence_threshold=getattr(global_config, "yolo_confidence_threshold", 0.45),
+            llava_every_n_frames=getattr(global_config, "llava_every_n_frames", 1),
         )
     except Exception as e:
-        print(f"FATAL ERROR: Could not initialize pipeline: {e}")
+        print(f"FATAL: pipeline init failed: {e}")
         return
 
-    # ===== IMAGE-BASED PROCESSING (NEW) =====
-    # Run on images from resources folder
-    pipeline.run_on_images(image_folder="resources")
-    
-    # ===== UNCOMMENT BELOW FOR CUSTOM IMAGE PATHS =====
-    # pipeline.run_on_images(image_paths=[
-    #     "resources/Aston Martin.jpg",
-    #     # Add more images here
-    # ])
+    pipeline.run_on_images(image_folder=getattr(global_config, "image_folder", "resources"))
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
