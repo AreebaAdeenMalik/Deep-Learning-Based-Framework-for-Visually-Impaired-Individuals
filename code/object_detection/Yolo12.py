@@ -399,8 +399,8 @@ if __name__ == "__main__":
         run_yolo_detection_on_image(image_path)
     else:
         print(f"Image not found at {image_path}.")
-        print("Using resources/Aston Martin.jpg instead...")
-        alt_path = "resources/Aston Martin.jpg"
+        print("Using resources/my_image.jpg.jpg instead...")
+        alt_path = "resources/my_image.jpg.jpg"
         if os.path.exists(alt_path):
             run_yolo_detection_on_image(alt_path)
         else:
