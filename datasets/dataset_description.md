@@ -6,7 +6,7 @@ Primary Dataset:
 COCO Dataset
 
 Usage:
-Object detection of everyday environmental objects including:
+Object detection and depth estimation of everyday environmental objects including:
 
 Classes
   - person
